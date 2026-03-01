@@ -23,20 +23,18 @@ Usage
 import argparse
 import json
 import re
-import sys
 import time
-from datetime import datetime, timezone
-from typing import List, Optional
+from datetime import UTC, datetime
 
 import duckdb
 import httpx
 from loguru import logger
-from pydantic import BaseModel, Field, model_validator
-
+from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
+
 
 class TimeWindow(BaseModel):
     label: str
@@ -117,7 +115,7 @@ class CommuteData(BaseModel):
     success: bool
     summary: CommuteSummary
     timestamp: datetime
-    corridors: List[Corridor]
+    corridors: list[Corridor]
 
 
 class Market(BaseModel):
@@ -126,22 +124,22 @@ class Market(BaseModel):
     region: str
     price: float
     tokenId: str
-    seriesId: Optional[str] = None
-    eventSlug: Optional[str] = None
-    image: Optional[str] = None
-    volume: Optional[float] = None
-    volume_24h: Optional[float] = None
-    endDate: Optional[float] = None
+    seriesId: str | None = None
+    eventSlug: str | None = None
+    image: str | None = None
+    volume: float | None = None
+    volume_24h: float | None = None
+    endDate: float | None = None
 
 
 class DoomsdayData(BaseModel):
-    markets: List[Market]
-    lowVolume: List[Market]
+    markets: list[Market]
+    lowVolume: list[Market]
     timestamp: datetime
 
 
 class PizzintSnapshot(BaseModel):
-    scraped_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    scraped_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     commute: CommuteData
     doomsday: DoomsdayData
 
@@ -307,15 +305,28 @@ def persist_snapshot(con: duckdb.DuckDBPyConnection, snap: PizzintSnapshot) -> N
         )
         """,
         [
-            scraped_at, ct,
-            o.level, o.label, o.description,
-            s.isAnomalous, s.anomalyLevel,
-            s.avgSpeedRatio, s.weightedSpeedRatio,
-            s.corridorsTotal, s.corridorsReporting,
-            os_.crossCorrelation, os_.tier1AvgDeviation, os_.tier2AvgDeviation,
+            scraped_at,
+            ct,
+            o.level,
+            o.label,
+            o.description,
+            s.isAnomalous,
+            s.anomalyLevel,
+            s.avgSpeedRatio,
+            s.weightedSpeedRatio,
+            s.corridorsTotal,
+            s.corridorsReporting,
+            os_.crossCorrelation,
+            os_.tier1AvgDeviation,
+            os_.tier2AvgDeviation,
             os_.dominantSignal,
-            tw.label, tw.window, tw.hourET, tw.isWeekend,
-            m.current, m.baseline, m.popularityRatio,
+            tw.label,
+            tw.window,
+            tw.hourET,
+            tw.isWeekend,
+            m.current,
+            m.baseline,
+            m.popularityRatio,
             o.rawDeviation,
         ],
     )
@@ -328,45 +339,56 @@ def persist_snapshot(con: duckdb.DuckDBPyConnection, snap: PizzintSnapshot) -> N
             )
             """,
             [
-                scraped_at, ct,
-                corridor.id, corridor.name, corridor.tier,
-                corridor.status, corridor.direction, corridor.shortName,
-                corridor.confidence, corridor.speedRatio,
-                corridor.currentSpeed, corridor.freeFlowSpeed,
+                scraped_at,
+                ct,
+                corridor.id,
+                corridor.name,
+                corridor.tier,
+                corridor.status,
+                corridor.direction,
+                corridor.shortName,
+                corridor.confidence,
+                corridor.speedRatio,
+                corridor.currentSpeed,
+                corridor.freeFlowSpeed,
                 corridor.optempoWeight,
-                corridor.currentTravelTime, corridor.freeFlowTravelTime,
+                corridor.currentTravelTime,
+                corridor.freeFlowTravelTime,
                 corridor.roadClosure,
             ],
         )
 
     dt = snap.doomsday.timestamp
-    all_markets = [
-        (mkt, False) for mkt in snap.doomsday.markets
-    ] + [
+    all_markets = [(mkt, False) for mkt in snap.doomsday.markets] + [
         (mkt, True) for mkt in snap.doomsday.lowVolume
     ]
     for mkt, is_low in all_markets:
         end_ts = (
-            datetime.fromtimestamp(mkt.endDate / 1000, tz=timezone.utc)
-            if mkt.endDate is not None
-            else None
+            datetime.fromtimestamp(mkt.endDate / 1000, tz=UTC) if mkt.endDate is not None else None
         )
         con.execute(
             """
             INSERT INTO market_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
-                scraped_at, dt,
-                mkt.slug, mkt.label, mkt.region,
-                mkt.price, mkt.volume, mkt.volume_24h,
-                end_ts, is_low,
+                scraped_at,
+                dt,
+                mkt.slug,
+                mkt.label,
+                mkt.region,
+                mkt.price,
+                mkt.volume,
+                mkt.volume_24h,
+                end_ts,
+                is_low,
             ],
         )
 
     con.commit()
     logger.success(
         "Persisted snapshot — optempo={} ({}) | markets={} | corridors={}",
-        o.level, o.label,
+        o.level,
+        o.label,
         len(all_markets),
         len(snap.commute.corridors),
     )
@@ -375,6 +397,7 @@ def persist_snapshot(con: duckdb.DuckDBPyConnection, snap: PizzintSnapshot) -> N
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def main():
     parser = argparse.ArgumentParser(description="pizzint.watch scraper → DuckLake")
