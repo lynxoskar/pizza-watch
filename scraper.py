@@ -3,21 +3,20 @@ pizzint.watch scraper
 ---------------------
 Fetches the Pentagon Pizza Index data from https://pizzint.watch by parsing
 the Next.js SSR payload embedded in the HTML (no headless browser needed).
+Also tails /api/dashboard-data (place popularity) and /api/osint-feed (OSINT tweets).
 
-Outputs to a DuckLake: a DuckDB file (`pizza_lake.duckdb`) with two tables:
+Outputs to a DuckLake (DuckDB file) with tables:
   - commute_snapshots   : per-scrape traffic / optempo summary
-  - market_snapshots    : per-scrape polymarket signals
+  - corridor_snapshots  : per-scrape per-corridor traffic
+  - market_snapshots    : per-scrape polymarket prices
+  - place_popularity    : hourly pizza-place popularity ticks (deduped)
+  - osint_tweets        : OSINT tweet feed (deduped on tweet id)
+  - scrape_log          : every HTTP attempt with status + duration
 
 Usage
 -----
-  # Single scrape (backfill / one-shot):
-  python scraper.py --once
-
-  # Tail mode (continuous polling):
-  python scraper.py --interval 300      # poll every 5 minutes (default)
-
-  # Backfill by repeating a single historic fetch N times (demo):
-  python scraper.py --once --db pizza_lake.duckdb
+  python scraper.py --once               # single SSR scrape and exit
+  python scraper.py --interval 300       # tail mode, poll every 5 minutes
 """
 
 import argparse
@@ -25,6 +24,7 @@ import json
 import re
 import time
 from datetime import UTC, datetime
+from typing import Any
 
 import duckdb
 import httpx
@@ -32,7 +32,35 @@ from loguru import logger
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
-# Pydantic models
+# Constants
+# ---------------------------------------------------------------------------
+
+URL_SSR = "https://www.pizzint.watch/"
+URL_DASHBOARD = "https://www.pizzint.watch/api/dashboard-data"
+URL_OSINT = "https://www.pizzint.watch/api/osint-feed?includeTruth=true"
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# Retry config
+_MAX_RETRIES = 5
+_BACKOFF_CAP_S = 300  # 5 minutes max between retries
+_RETRY_AFTER_DEFAULT_S = 600  # 10 minutes if 429 has no Retry-After header
+_BACKOFF_5XX_S = 30
+
+# Tail cadences
+_CADENCE_SSR_S = 300  # every 5 min — SSR page (commute + markets)
+_CADENCE_DASHBOARD_S = 3600  # every 60 min — place popularity
+_CADENCE_OSINT_S = 900  # every 15 min — OSINT tweets
+
+# ---------------------------------------------------------------------------
+# Pydantic models — SSR payload
 # ---------------------------------------------------------------------------
 
 
@@ -63,16 +91,6 @@ class Optempo(BaseModel):
     timeWindow: TimeWindow
     description: str
     rawDeviation: float
-
-
-class CorridorScore(BaseModel):
-    id: str
-    tier: int
-    deviation: float
-    speedRatio: float
-    contribution: float
-    anomalySignal: float
-    expectedRatio: float
 
 
 class Corridor(BaseModel):
@@ -145,47 +163,134 @@ class PizzintSnapshot(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Scraping logic
+# Pydantic models — API endpoints
 # ---------------------------------------------------------------------------
 
-URL = "https://www.pizzint.watch/"
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
+
+class SparklinePoint(BaseModel):
+    place_id: str
+    current_popularity: int | None = None  # null when place is closed / no data
+    recorded_at: datetime
 
 
-def _extract_payload(html: str) -> dict:
+class PlaceData(BaseModel):
+    place_id: str
+    name: str
+    current_popularity: int | None = None
+    percentage_of_usual: float | None = None
+    is_spike: bool = False
+    spike_magnitude: float | None = None
+    data_source: str | None = None
+    recorded_at: datetime
+    data_freshness: str | None = None
+    sparkline_24h: list[SparklinePoint] = Field(default_factory=list)
+    is_closed_now: bool = False
+
+
+class DashboardResponse(BaseModel):
+    success: bool
+    data: list[PlaceData]
+    overall_index: float | None = None
+    defcon_level: int | None = None
+    timestamp: datetime
+
+
+class OsintTweet(BaseModel):
+    id: str
+    text: str
+    url: str
+    timestamp: datetime
+    handle: str
+    isAlert: bool = False
+
+
+class OsintFeedResponse(BaseModel):
+    success: bool
+    tweets: list[OsintTweet]
+    timestamp: datetime
+    source: str | None = None
+    sourceCount: int | None = None
+
+
+# ---------------------------------------------------------------------------
+# HTTP client with retry + rate-limit handling  [bd-1ew]
+# ---------------------------------------------------------------------------
+
+
+def _fetch_with_retry(url: str, client: httpx.Client) -> httpx.Response:
     """
-    Parse the Next.js __next_f SSR chunks to extract the initialDoomsdayData
-    and initialCommuteData objects embedded in the page HTML.
+    GET `url` with exponential backoff retry.
+
+    Retry policy:
+      - 429: respect Retry-After header, else wait _RETRY_AFTER_DEFAULT_S
+      - 5xx: wait _BACKOFF_5XX_S then retry with backoff
+      - network errors: backoff 2^attempt seconds, capped at _BACKOFF_CAP_S
+      - max _MAX_RETRIES attempts total before re-raising
     """
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = client.get(url)
+            if resp.status_code == 429:
+                wait = int(resp.headers.get("retry-after", _RETRY_AFTER_DEFAULT_S))
+                logger.warning("[PIZZINT] 429 rate-limited on {} — waiting {}s", url, wait)
+                time.sleep(wait)
+                continue
+            if resp.status_code >= 500:
+                wait = min(_BACKOFF_5XX_S * (2**attempt), _BACKOFF_CAP_S)
+                logger.warning(
+                    "[PIZZINT] HTTP {} on {} (attempt {}/{}) — retrying in {}s",
+                    resp.status_code,
+                    url,
+                    attempt + 1,
+                    _MAX_RETRIES,
+                    wait,
+                )
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp
+        except httpx.RequestError as exc:
+            last_exc = exc
+            wait = min(2**attempt, _BACKOFF_CAP_S)
+            logger.warning(
+                "[PIZZINT] Request error on {} (attempt {}/{}) — retrying in {}s: {}",
+                url,
+                attempt + 1,
+                _MAX_RETRIES,
+                wait,
+                exc,
+            )
+            time.sleep(wait)
+
+    raise last_exc or RuntimeError(f"Failed to fetch {url} after {_MAX_RETRIES} attempts")
+
+
+# ---------------------------------------------------------------------------
+# Fetch functions
+# ---------------------------------------------------------------------------
+
+
+def _extract_payload(html: str) -> dict[str, Any]:
+    """Parse the Next.js __next_f SSR chunks embedded in the HTML."""
     idx = html.find("initialDoomsdayData")
     if idx < 0:
         raise ValueError("Could not find initialDoomsdayData in HTML")
 
-    # Walk back to the enclosing self.__next_f.push call
     start = html.rfind("self.__next_f.push", 0, idx)
     end = html.find("</script>", idx)
     chunk = html[start:end]
 
-    # The argument is a JSON-encoded string (double-escaped)
     m = re.search(r'self\.__next_f\.push\(\[1,"(.*)"\]\)', chunk, re.DOTALL)
     if not m:
         raise ValueError("Could not parse __next_f.push chunk")
 
     raw = m.group(1).encode().decode("unicode_escape")
 
-    # Locate the top-level object
     payload_start = raw.find('{"initialDoomsdayData"')
     if payload_start < 0:
         raise ValueError("Could not locate top-level payload object")
 
-    # Walk to the matching closing brace
     payload_chars = list(raw[payload_start:])
     depth = 0
     for i, c in enumerate(payload_chars):
@@ -194,102 +299,173 @@ def _extract_payload(html: str) -> dict:
         elif c == "}":
             depth -= 1
             if depth == 0:
-                raw_json = "".join(payload_chars[: i + 1])
-                break
-    else:
-        raise ValueError("Unbalanced braces in payload")
+                return json.loads("".join(payload_chars[: i + 1]))
 
-    return json.loads(raw_json)
+    raise ValueError("Unbalanced braces in SSR payload")
 
 
 def fetch_snapshot() -> PizzintSnapshot:
-    logger.info("Fetching {}", URL)
+    """Fetch the SSR page and extract commute + market snapshot."""
+    logger.info("[PIZZINT] Fetching SSR snapshot from {}", URL_SSR)
     with httpx.Client(headers=HEADERS, timeout=30, follow_redirects=True) as client:
-        resp = client.get(URL)
-        resp.raise_for_status()
+        resp = _fetch_with_retry(URL_SSR, client)
 
     payload = _extract_payload(resp.text)
-
     commute = CommuteData.model_validate(payload["initialCommuteData"])
     doomsday = DoomsdayData.model_validate(payload["initialDoomsdayData"])
-
     return PizzintSnapshot(commute=commute, doomsday=doomsday)
 
 
+def fetch_dashboard() -> DashboardResponse:
+    """Fetch /api/dashboard-data — place popularity + defcon."""
+    logger.info("[PIZZINT] Fetching dashboard-data from {}", URL_DASHBOARD)
+    with httpx.Client(headers=HEADERS, timeout=30, follow_redirects=True) as client:
+        resp = _fetch_with_retry(URL_DASHBOARD, client)
+    return DashboardResponse.model_validate(resp.json())
+
+
+def fetch_osint_feed() -> OsintFeedResponse:
+    """Fetch /api/osint-feed — OSINT tweets."""
+    logger.info("[PIZZINT] Fetching osint-feed from {}", URL_OSINT)
+    with httpx.Client(headers=HEADERS, timeout=30, follow_redirects=True) as client:
+        resp = _fetch_with_retry(URL_OSINT, client)
+    return OsintFeedResponse.model_validate(resp.json())
+
+
 # ---------------------------------------------------------------------------
-# DuckLake persistence
+# DuckLake DDL  [bd-clj]
 # ---------------------------------------------------------------------------
 
 DDL = """
 CREATE TABLE IF NOT EXISTS commute_snapshots (
-    scraped_at          TIMESTAMPTZ NOT NULL,
-    data_timestamp      TIMESTAMPTZ NOT NULL,
-    optempo_level       INTEGER,
-    optempo_label       VARCHAR,
-    optempo_description VARCHAR,
-    is_anomalous        BOOLEAN,
-    anomaly_level       VARCHAR,
-    avg_speed_ratio     DOUBLE,
-    weighted_speed_ratio DOUBLE,
-    corridors_total     INTEGER,
-    corridors_reporting INTEGER,
-    cross_correlation   DOUBLE,
-    tier1_avg_deviation DOUBLE,
-    tier2_avg_deviation DOUBLE,
-    dominant_signal     VARCHAR,
-    time_window_label   VARCHAR,
-    time_window         VARCHAR,
-    hour_et             INTEGER,
-    is_weekend          BOOLEAN,
-    metro_current       DOUBLE,
-    metro_baseline      DOUBLE,
-    metro_popularity_ratio DOUBLE,
-    raw_deviation       DOUBLE
+    scraped_at              TIMESTAMPTZ NOT NULL,
+    data_timestamp          TIMESTAMPTZ NOT NULL,
+    optempo_level           INTEGER,
+    optempo_label           VARCHAR,
+    optempo_description     VARCHAR,
+    is_anomalous            BOOLEAN,
+    anomaly_level           VARCHAR,
+    avg_speed_ratio         DOUBLE,
+    weighted_speed_ratio    DOUBLE,
+    corridors_total         INTEGER,
+    corridors_reporting     INTEGER,
+    cross_correlation       DOUBLE,
+    tier1_avg_deviation     DOUBLE,
+    tier2_avg_deviation     DOUBLE,
+    dominant_signal         VARCHAR,
+    time_window_label       VARCHAR,
+    time_window             VARCHAR,
+    hour_et                 INTEGER,
+    is_weekend              BOOLEAN,
+    metro_current           DOUBLE,
+    metro_baseline          DOUBLE,
+    metro_popularity_ratio  DOUBLE,
+    raw_deviation           DOUBLE
 );
 
 CREATE TABLE IF NOT EXISTS corridor_snapshots (
-    scraped_at          TIMESTAMPTZ NOT NULL,
-    data_timestamp      TIMESTAMPTZ NOT NULL,
-    corridor_id         VARCHAR NOT NULL,
-    name                VARCHAR,
-    tier                INTEGER,
-    status              VARCHAR,
-    direction           VARCHAR,
-    short_name          VARCHAR,
-    confidence          DOUBLE,
-    speed_ratio         DOUBLE,
-    current_speed       DOUBLE,
-    free_flow_speed     DOUBLE,
-    optempo_weight      DOUBLE,
-    current_travel_time DOUBLE,
-    free_flow_travel_time DOUBLE,
-    road_closure        BOOLEAN
+    scraped_at              TIMESTAMPTZ NOT NULL,
+    data_timestamp          TIMESTAMPTZ NOT NULL,
+    corridor_id             VARCHAR NOT NULL,
+    name                    VARCHAR,
+    tier                    INTEGER,
+    status                  VARCHAR,
+    direction               VARCHAR,
+    short_name              VARCHAR,
+    confidence              DOUBLE,
+    speed_ratio             DOUBLE,
+    current_speed           DOUBLE,
+    free_flow_speed         DOUBLE,
+    optempo_weight          DOUBLE,
+    current_travel_time     DOUBLE,
+    free_flow_travel_time   DOUBLE,
+    road_closure            BOOLEAN
 );
 
 CREATE TABLE IF NOT EXISTS market_snapshots (
-    scraped_at  TIMESTAMPTZ NOT NULL,
-    data_timestamp TIMESTAMPTZ NOT NULL,
-    slug        VARCHAR NOT NULL,
-    label       VARCHAR,
-    region      VARCHAR,
-    price       DOUBLE,
-    volume      DOUBLE,
-    volume_24h  DOUBLE,
-    end_date    TIMESTAMPTZ,
-    is_low_volume BOOLEAN
+    scraped_at      TIMESTAMPTZ NOT NULL,
+    data_timestamp  TIMESTAMPTZ NOT NULL,
+    slug            VARCHAR NOT NULL,
+    label           VARCHAR,
+    region          VARCHAR,
+    price           DOUBLE,
+    volume          DOUBLE,
+    volume_24h      DOUBLE,
+    end_date        TIMESTAMPTZ,
+    is_low_volume   BOOLEAN
+);
+
+-- Pizza-place hourly popularity ticks; deduped on (place_id, recorded_at)  [bd-36r]
+CREATE TABLE IF NOT EXISTS place_popularity (
+    place_id            VARCHAR NOT NULL,
+    name                VARCHAR,
+    recorded_at         TIMESTAMPTZ NOT NULL,
+    current_popularity  INTEGER,  -- nullable when place is closed / no data
+    data_freshness      VARCHAR,
+    is_spike            BOOLEAN,
+    spike_magnitude     DOUBLE,
+    PRIMARY KEY (place_id, recorded_at)
+);
+
+-- OSINT tweet feed; deduped on tweet id  [bd-36r]
+CREATE TABLE IF NOT EXISTS osint_tweets (
+    id          VARCHAR PRIMARY KEY,
+    text        VARCHAR,
+    url         VARCHAR,
+    timestamp   TIMESTAMPTZ,
+    handle      VARCHAR,
+    is_alert    BOOLEAN,
+    ingested_at TIMESTAMPTZ NOT NULL
+);
+
+-- Scrape attempt log  [bd-3kb]
+CREATE TABLE IF NOT EXISTS scrape_log (
+    logged_at       TIMESTAMPTZ NOT NULL,
+    endpoint        VARCHAR NOT NULL,
+    success         BOOLEAN NOT NULL,
+    status_code     INTEGER,
+    duration_ms     INTEGER,
+    error_msg       VARCHAR
 );
 """
+
+
+def _count(con: duckdb.DuckDBPyConnection, table: str) -> int:
+    row = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()  # noqa: S608
+    assert row is not None
+    return int(row[0])
 
 
 def init_db(path: str) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect(path)
     con.execute(DDL)
     con.commit()
-    logger.info("DuckLake initialised at {}", path)
+    logger.info("[PIZZINT] DuckLake initialised at {}", path)
     return con
 
 
+# ---------------------------------------------------------------------------
+# Persistence helpers
+# ---------------------------------------------------------------------------
+
+
+def _log_scrape(
+    con: duckdb.DuckDBPyConnection,
+    endpoint: str,
+    success: bool,
+    status_code: int | None = None,
+    duration_ms: int | None = None,
+    error_msg: str | None = None,
+) -> None:
+    con.execute(
+        "INSERT INTO scrape_log VALUES (?, ?, ?, ?, ?, ?)",
+        [datetime.now(UTC), endpoint, success, status_code, duration_ms, error_msg],
+    )
+    con.commit()
+
+
 def persist_snapshot(con: duckdb.DuckDBPyConnection, snap: PizzintSnapshot) -> None:
+    """Persist SSR commute + market snapshot."""
     scraped_at = snap.scraped_at
     ct = snap.commute.timestamp
     o = snap.commute.optempo
@@ -299,11 +475,7 @@ def persist_snapshot(con: duckdb.DuckDBPyConnection, snap: PizzintSnapshot) -> N
     m = snap.commute.metro
 
     con.execute(
-        """
-        INSERT INTO commute_snapshots VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-        )
-        """,
+        "INSERT INTO commute_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         [
             scraped_at,
             ct,
@@ -333,11 +505,7 @@ def persist_snapshot(con: duckdb.DuckDBPyConnection, snap: PizzintSnapshot) -> N
 
     for corridor in snap.commute.corridors:
         con.execute(
-            """
-            INSERT INTO corridor_snapshots VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-            )
-            """,
+            "INSERT INTO corridor_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 scraped_at,
                 ct,
@@ -367,9 +535,7 @@ def persist_snapshot(con: duckdb.DuckDBPyConnection, snap: PizzintSnapshot) -> N
             datetime.fromtimestamp(mkt.endDate / 1000, tz=UTC) if mkt.endDate is not None else None
         )
         con.execute(
-            """
-            INSERT INTO market_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+            "INSERT INTO market_snapshots VALUES (?,?,?,?,?,?,?,?,?,?)",
             [
                 scraped_at,
                 dt,
@@ -386,7 +552,7 @@ def persist_snapshot(con: duckdb.DuckDBPyConnection, snap: PizzintSnapshot) -> N
 
     con.commit()
     logger.success(
-        "Persisted snapshot — optempo={} ({}) | markets={} | corridors={}",
+        "[PIZZINT] SSR snapshot — optempo={} ({}) | markets={} | corridors={}",
         o.level,
         o.label,
         len(all_markets),
@@ -394,52 +560,176 @@ def persist_snapshot(con: duckdb.DuckDBPyConnection, snap: PizzintSnapshot) -> N
     )
 
 
+def persist_dashboard(con: duckdb.DuckDBPyConnection, resp: DashboardResponse) -> int:
+    """
+    Persist place popularity ticks from a dashboard response.
+    Deduped on (place_id, recorded_at) via ON CONFLICT DO NOTHING.
+    Returns the number of new rows inserted.
+    """
+    before = _count(con, "place_popularity")
+    for place in resp.data:
+        for tick in place.sparkline_24h:
+            con.execute(
+                """
+                INSERT INTO place_popularity
+                    (place_id, name, recorded_at, current_popularity,
+                     data_freshness, is_spike, spike_magnitude)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (place_id, recorded_at) DO NOTHING
+                """,
+                [
+                    tick.place_id,
+                    place.name,
+                    tick.recorded_at,
+                    tick.current_popularity,
+                    place.data_freshness,
+                    place.is_spike,
+                    place.spike_magnitude,
+                ],
+            )
+    con.commit()
+    inserted = _count(con, "place_popularity") - before
+    logger.success(
+        "[PIZZINT] Dashboard — {} places | {} new popularity ticks inserted",
+        len(resp.data),
+        inserted,
+    )
+    return inserted
+
+
+def persist_osint_feed(con: duckdb.DuckDBPyConnection, resp: OsintFeedResponse) -> int:
+    """
+    Persist OSINT tweets, deduped on tweet id via ON CONFLICT DO NOTHING.
+    Returns the number of new rows inserted.
+    """
+    ingested_at = datetime.now(UTC)
+    before = _count(con, "osint_tweets")
+    for tweet in resp.tweets:
+        con.execute(
+            """
+            INSERT INTO osint_tweets
+                (id, text, url, timestamp, handle, is_alert, ingested_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (id) DO NOTHING
+            """,
+            [
+                tweet.id,
+                tweet.text,
+                tweet.url,
+                tweet.timestamp,
+                tweet.handle,
+                tweet.isAlert,
+                ingested_at,
+            ],
+        )
+    con.commit()
+    inserted = _count(con, "osint_tweets") - before
+    logger.success(
+        "[PIZZINT] OSINT feed — {} tweets received | {} new inserted",
+        len(resp.tweets),
+        inserted,
+    )
+    return inserted
+
+
+# ---------------------------------------------------------------------------
+# Timed scrape wrappers (log every attempt)
+# ---------------------------------------------------------------------------
+
+
+def _timed_fetch_snapshot(con: duckdb.DuckDBPyConnection) -> PizzintSnapshot | None:
+    t0 = time.monotonic()
+    try:
+        snap = fetch_snapshot()
+        persist_snapshot(con, snap)
+        _log_scrape(con, URL_SSR, True, 200, int((time.monotonic() - t0) * 1000))
+        return snap
+    except Exception as exc:
+        _log_scrape(con, URL_SSR, False, None, int((time.monotonic() - t0) * 1000), str(exc))
+        logger.error("[PIZZINT] SSR fetch failed: {}", exc)
+        return None
+
+
+def _timed_fetch_dashboard(con: duckdb.DuckDBPyConnection) -> None:
+    t0 = time.monotonic()
+    try:
+        resp = fetch_dashboard()
+        persist_dashboard(con, resp)
+        _log_scrape(con, URL_DASHBOARD, True, 200, int((time.monotonic() - t0) * 1000))
+    except Exception as exc:
+        _log_scrape(con, URL_DASHBOARD, False, None, int((time.monotonic() - t0) * 1000), str(exc))
+        logger.error("[PIZZINT] Dashboard fetch failed: {}", exc)
+
+
+def _timed_fetch_osint(con: duckdb.DuckDBPyConnection) -> None:
+    t0 = time.monotonic()
+    try:
+        resp = fetch_osint_feed()
+        persist_osint_feed(con, resp)
+        _log_scrape(con, URL_OSINT, True, 200, int((time.monotonic() - t0) * 1000))
+    except Exception as exc:
+        _log_scrape(con, URL_OSINT, False, None, int((time.monotonic() - t0) * 1000), str(exc))
+        logger.error("[PIZZINT] OSINT fetch failed: {}", exc)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="pizzint.watch scraper → DuckLake")
     parser.add_argument("--db", default="pizza_lake.duckdb", help="DuckDB file path")
-    parser.add_argument("--once", action="store_true", help="Scrape once and exit")
+    parser.add_argument("--once", action="store_true", help="Scrape all endpoints once and exit")
     parser.add_argument(
         "--interval",
         type=int,
-        default=300,
-        help="Poll interval in seconds for tail mode (default: 300)",
+        default=_CADENCE_SSR_S,
+        help="SSR poll interval in seconds for tail mode (default: 300)",
     )
     args = parser.parse_args()
 
     con = init_db(args.db)
 
     if args.once:
-        snap = fetch_snapshot()
-        persist_snapshot(con, snap)
+        _timed_fetch_snapshot(con)
+        _timed_fetch_dashboard(con)
+        _timed_fetch_osint(con)
         con.close()
         return
 
-    # Tail mode
-    logger.info("Tail mode: polling every {}s. Ctrl-C to stop.", args.interval)
-    while True:
-        try:
-            snap = fetch_snapshot()
-            persist_snapshot(con, snap)
-        except httpx.HTTPStatusError as exc:
-            logger.error("HTTP error: {}", exc)
-        except httpx.RequestError as exc:
-            logger.error("Request error: {}", exc)
-        except ValueError as exc:
-            logger.error("Parse error: {}", exc)
-        except Exception as exc:
-            logger.exception("Unexpected error: {}", exc)
+    # Tail mode — track last-run timestamps per endpoint
+    logger.info(
+        "[PIZZINT] Tail mode — SSR={}s | dashboard={}s | osint={}s. Ctrl-C to stop.",
+        args.interval,
+        _CADENCE_DASHBOARD_S,
+        _CADENCE_OSINT_S,
+    )
 
-        logger.info("Sleeping {}s …", args.interval)
-        try:
-            time.sleep(args.interval)
-        except KeyboardInterrupt:
-            logger.info("Interrupted. Closing DB.")
-            break
+    last_ssr = 0.0
+    last_dashboard = 0.0
+    last_osint = 0.0
+
+    try:
+        while True:
+            now = time.monotonic()
+
+            if now - last_ssr >= args.interval:
+                _timed_fetch_snapshot(con)
+                last_ssr = time.monotonic()
+
+            if now - last_dashboard >= _CADENCE_DASHBOARD_S:
+                _timed_fetch_dashboard(con)
+                last_dashboard = time.monotonic()
+
+            if now - last_osint >= _CADENCE_OSINT_S:
+                _timed_fetch_osint(con)
+                last_osint = time.monotonic()
+
+            time.sleep(10)  # check cadences every 10s
+
+    except KeyboardInterrupt:
+        logger.info("[PIZZINT] Interrupted. Closing DB.")
 
     con.close()
 
